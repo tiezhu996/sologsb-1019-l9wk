@@ -87,8 +87,11 @@ export default function TranscriptPanel(props: { store: Store }) {
                 <span class="segment-index">#{index() + 1}</span>
                 <span class="segment-time">{segment.time}</span>
                 <strong>{segment.speaker}</strong>
-                <Show when={segment.assignments.A.join('|') !== segment.assignments.B.join('|')}>
+                <Show when={props.store.hasDisagreement(segment)}>
                   <span class="conflict-dot" title="两位编码者判断不一致">分歧</span>
+                </Show>
+                <Show when={props.store.currentAdjudicationFor(segment.id)}>
+                  <span class="settled-dot" title="分歧已裁决，结论随编码结果导出">已裁决</span>
                 </Show>
               </div>
               <p>{segment.text}</p>

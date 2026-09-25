@@ -29,6 +29,23 @@ export interface Transcript {
   sourceName: string;
 }
 
+export type AdjudicationResolution = 'A' | 'B' | 'custom';
+
+export interface Adjudication {
+  id: string;
+  segmentId: string;
+  /** 裁决落笔时双方判断的快照（排序后的主题 id），用于检测结论是否过期 */
+  basisA: string[];
+  basisB: string[];
+  /** 采纳 A 方 / 采纳 B 方 / 另立主题 */
+  resolution: AdjudicationResolution;
+  /** 最终采纳的主题 id 集合；空数组表示结论是“不编码” */
+  themes: string[];
+  rationale: string;
+  decidedBy: string;
+  decidedAt: string;
+}
+
 export interface CodingState {
   revision: number;
   updatedAt: string;
@@ -40,6 +57,7 @@ export interface CodingState {
   transcripts: Transcript[];
   segments: Segment[];
   themes: Theme[];
+  adjudications: Adjudication[];
   audit: Array<{ id: string; at: string; action: string; detail: string }>;
 }
 

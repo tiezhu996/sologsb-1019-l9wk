@@ -1,16 +1,30 @@
 import { createEffect, createSignal } from 'solid-js';
 import { createStore, reconcile, unwrap } from 'solid-js/store';
 import { seedState } from '../data/seed';
-import type { CoderId, CodingState, PersistedEnvelope, Segment, Theme } from '../types';
+import type { Adjudication, AdjudicationResolution, CoderId, CodingState, PersistedEnvelope, Segment, Theme } from '../types';
 import { readEnvelope, writeEnvelope } from '../utils/db';
 
 const STORAGE_KEY = 'sologsb-1019-state-v1';
 const TAB_ID = crypto.randomUUID();
 
+const sortCodes = (codes: string[]) => [...codes].sort();
+
+const sameCodes = (a: string[], b: string[]) => {
+  if (a.length !== b.length) return false;
+  const sortedA = sortCodes(a);
+  const sortedB = sortCodes(b);
+  return sortedA.every((code, index) => code === sortedB[index]);
+};
+
+const normalizeState = (state: CodingState): CodingState => {
+  if (!Array.isArray(state.adjudications)) state.adjudications = [];
+  return state;
+};
+
 const loadLocal = (): CodingState => {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw) as CodingState;
+    if (raw) return normalizeState(JSON.parse(raw) as CodingState);
   } catch {
     localStorage.removeItem(STORAGE_KEY);
   }
@@ -262,26 +276,98 @@ export function useCodingStore() {
     });
   };
 
+  /** 双方判断是否一致（集合语义，与顺序无关） */
+  const hasDisagreement = (segment: Segment) => !sameCodes(segment.assignments.A, segment.assignments.B);
+
+  const adjudicationFor = (segmentId: string) => state.adjudications.find((item) => item.segmentId === segmentId) ?? null;
+
+  /**
+   * 裁决是否仍然生效：落笔后双方判断未再改动，且结论引用的主题仍然存在。
+   * 编码调整、批量重编码、主题合并/拆分/删除都会使过期结论自动失效。
+   */
+  const isAdjudicationCurrent = (adjudication: Adjudication) => {
+    const segment = state.segments.find((item) => item.id === adjudication.segmentId);
+    if (!segment) return false;
+    if (!sameCodes(adjudication.basisA, segment.assignments.A) || !sameCodes(adjudication.basisB, segment.assignments.B)) return false;
+    return adjudication.themes.every((id) => state.themes.some((theme) => theme.id === id));
+  };
+
+  const currentAdjudicationFor = (segmentId: string) => {
+    const adjudication = adjudicationFor(segmentId);
+    return adjudication && isAdjudicationCurrent(adjudication) ? adjudication : null;
+  };
+
+  /** 裁决待办：当前仍有分歧且没有生效裁决的片段；双方一致的片段不占用队列 */
+  const pendingAdjudications = () => state.segments
+    .filter((segment) => hasDisagreement(segment) && !currentAdjudicationFor(segment.id))
+    .sort((a, b) => a.order - b.order);
+
+  const settledAdjudications = () => state.adjudications.filter((item) => isAdjudicationCurrent(item));
+
+  const adjudicateSegment = (segmentId: string, resolution: AdjudicationResolution, themes: string[], rationale: string, decidedBy: string) => {
+    const segment = state.segments.find((item) => item.id === segmentId);
+    if (!segment || !hasDisagreement(segment)) return;
+    if (!rationale.trim() || !decidedBy.trim()) return;
+    // 采纳某一方时结论主题直接取自该方当前判断，另立主题时使用勾选集合
+    const conclusion = resolution === 'A' ? [...segment.assignments.A] : resolution === 'B' ? [...segment.assignments.B] : [...themes];
+    if (resolution === 'custom' && !conclusion.length) return;
+    const label = resolution === 'A' ? `采纳 ${state.coderA}` : resolution === 'B' ? `采纳 ${state.coderB}` : '另立主题';
+    transaction('裁决分歧', `${label} · ${segment.time} ${segment.speaker}`, (draft) => {
+      const target = draft.segments.find((item) => item.id === segmentId);
+      if (!target) return;
+      draft.adjudications = draft.adjudications.filter((item) => item.segmentId !== segmentId);
+      draft.adjudications.push({
+        id: `adj-${crypto.randomUUID()}`,
+        segmentId,
+        basisA: sortCodes(target.assignments.A),
+        basisB: sortCodes(target.assignments.B),
+        resolution,
+        themes: conclusion,
+        rationale: rationale.trim(),
+        decidedBy: decidedBy.trim(),
+        decidedAt: new Date().toISOString()
+      });
+    });
+  };
+
   const exportCoding = (format: 'json' | 'csv') => {
-    const segmentMap = new Map(state.segments.map((segment) => [segment.id, segment]));
     const themeMap = new Map(state.themes.map((theme) => [theme.id, theme]));
-    if (format === 'json') return JSON.stringify({ exportedAt: new Date().toISOString(), ...cloneState(state) }, null, 2);
+    const themePath = (id: string) => {
+      const names: string[] = [];
+      let current = themeMap.get(id);
+      while (current) {
+        names.unshift(current.name);
+        current = current.parentId ? themeMap.get(current.parentId) : undefined;
+      }
+      return names.length ? names.join(' / ') : '未知主题';
+    };
+    if (format === 'json') {
+      const snapshot = cloneState(state);
+      // 只导出生效中的裁决结论，过期结论（判断已变更或结论主题已不存在）不随结果发出
+      snapshot.adjudications = snapshot.adjudications.filter((adjudication) => {
+        const segment = snapshot.segments.find((item) => item.id === adjudication.segmentId);
+        return !!segment
+          && sameCodes(adjudication.basisA, segment.assignments.A)
+          && sameCodes(adjudication.basisB, segment.assignments.B)
+          && adjudication.themes.every((id) => themeMap.has(id));
+      });
+      return JSON.stringify({ exportedAt: new Date().toISOString(), ...snapshot }, null, 2);
+    }
     const escape = (value: string) => `"${value.replaceAll('"', '""')}"`;
-    const rows = [['片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录'].map(escape).join(',')];
+    const rows = [['片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录', '裁决结论', '裁决依据', '裁决人', '裁决时间'].map(escape).join(',')];
     state.segments.forEach((segment) => {
+      const adjudication = currentAdjudicationFor(segment.id);
+      const verdict = adjudication
+        ? (adjudication.themes.length ? adjudication.themes.map(themePath).join(' | ') : '（不编码）')
+        : hasDisagreement(segment) ? '待裁决' : '';
+      const verdictWhy = adjudication?.rationale ?? '';
+      const verdictBy = adjudication?.decidedBy ?? '';
+      const verdictAt = adjudication?.decidedAt ?? '';
       (['A', 'B'] as CoderId[]).forEach((coder) => {
         const name = coder === 'A' ? state.coderA : state.coderB;
         const themeIds = segment.assignments[coder];
-        const paths = themeIds.length ? themeIds.map((id) => {
-          const names: string[] = [];
-          let current = themeMap.get(id);
-          while (current) {
-            names.unshift(current.name);
-            current = current.parentId ? themeMap.get(current.parentId) : undefined;
-          }
-          return names.join(' / ');
-        }) : ['未编码'];
-        rows.push([segment.id, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segmentMap.get(segment.id)?.note ?? ''].map(escape).join(','));
+        const paths = themeIds.length ? themeIds.map(themePath) : ['未编码'];
+        rows.push([segment.id, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segment.note, verdict, verdictWhy, verdictBy, verdictAt].map(escape).join(','));
       });
     });
     return `\uFEFF${rows.join('\n')}`;
@@ -308,7 +394,7 @@ export function useCodingStore() {
     if (!remote) return;
     setUndoStack((items) => [...items, cloneState(state)]);
     setRedoStack([]);
-    setState(reconcile(remote.state, { merge: false }));
+    setState(reconcile(normalizeState(remote.state), { merge: false }));
     setRemoteEnvelope(null);
   };
 
@@ -335,6 +421,13 @@ export function useCodingStore() {
     updateSegment,
     importTranscript,
     addExample,
+    hasDisagreement,
+    adjudicationFor,
+    isAdjudicationCurrent,
+    currentAdjudicationFor,
+    pendingAdjudications,
+    settledAdjudications,
+    adjudicateSegment,
     exportCoding,
     downloadExport,
     orderedThemes,

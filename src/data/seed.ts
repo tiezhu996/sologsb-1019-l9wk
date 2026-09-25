@@ -46,6 +46,17 @@ export const seedState = (): CodingState => {
       note: ''
     })),
     themes,
+    adjudications: [{
+      id: 'adj-seed-1',
+      segmentId: 's-008',
+      basisA: ['t-family', 't-teacher'],
+      basisB: ['t-teacher'],
+      resolution: 'A',
+      themes: ['t-teacher', 't-family'],
+      rationale: '原文同时提到周老师劝学与母亲寄菜提醒进修，家庭支持与教师影响并存，采纳 A 方双主题判断。',
+      decidedBy: '林研究员',
+      decidedAt: new Date().toISOString()
+    }],
     audit: [{ id: 'a-seed', at: new Date().toISOString(), action: '初始化', detail: '载入演示访谈与两个编码者的判断' }]
   };
 };
