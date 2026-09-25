@@ -46,6 +46,22 @@ export const seedState = (): CodingState => {
       note: ''
     })),
     themes,
+    adjudications: [
+      {
+        id: 'adj-seed-001',
+        segmentId: 's-008',
+        decision: 'adoptA',
+        resolvedThemeIds: ['t-migration'],
+        rationale: '该片段核心是随丈夫工作调动而搬家，属迁徙决定；“工作与迁徙”父主题过于宽泛，不单独编码。',
+        adjudicator: '林研究员',
+        decidedAt: new Date().toISOString(),
+        status: 'active',
+        snapshotA: ['t-migration'],
+        snapshotB: ['t-migration', 't-work'],
+        originalA: ['t-migration'],
+        originalB: ['t-migration', 't-work']
+      }
+    ],
     audit: [{ id: 'a-seed', at: new Date().toISOString(), action: '初始化', detail: '载入演示访谈与两个编码者的判断' }]
   };
 };

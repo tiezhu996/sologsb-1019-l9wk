@@ -1,16 +1,22 @@
 import { createEffect, createSignal } from 'solid-js';
 import { createStore, reconcile, unwrap } from 'solid-js/store';
 import { seedState } from '../data/seed';
-import type { CoderId, CodingState, PersistedEnvelope, Segment, Theme } from '../types';
+import type { Adjudication, AdjudicationDecision, CoderId, CodingState, PersistedEnvelope, Segment, Theme } from '../types';
+import { activeAdjudicationsForExport, buildAdjudicationQueue, decisionLabel, evaluateAdjudication, sameAssignment, themePathList } from '../utils/adjudication';
 import { readEnvelope, writeEnvelope } from '../utils/db';
 
 const STORAGE_KEY = 'sologsb-1019-state-v1';
 const TAB_ID = crypto.randomUUID();
 
+const normalizeState = (stored: CodingState): CodingState => ({
+  ...stored,
+  adjudications: stored.adjudications ?? []
+});
+
 const loadLocal = (): CodingState => {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw) as CodingState;
+    if (raw) return normalizeState(JSON.parse(raw) as CodingState);
   } catch {
     localStorage.removeItem(STORAGE_KEY);
   }
@@ -19,12 +25,40 @@ const loadLocal = (): CodingState => {
 
 const cloneState = (state: CodingState): CodingState => structuredClone(unwrap(state));
 
+/**
+ * 每次写事务后执行：把已不成立的 active 裁决标记为失效并回到待办。
+ * 触发条件即需求中的两类：裁决后任一方判断被改动；主题合并/拆分后双方趋于一致。
+ */
+export const reconcileAdjudications = (draft: CodingState, now: string): Array<{ segmentId: string; reason: string }> => {
+  const segmentMap = new Map(draft.segments.map((segment) => [segment.id, segment]));
+  const invalidated: Array<{ segmentId: string; reason: string }> = [];
+  draft.adjudications.forEach((adjudication) => {
+    if (adjudication.status !== 'active') return;
+    const segment = segmentMap.get(adjudication.segmentId);
+    const evaluation = evaluateAdjudication(adjudication, segment);
+    if (evaluation.kind === 'valid') return;
+    const reason = evaluation.kind === 'converged'
+      ? '主题合并或拆分后双方判断已趋同，裁决自动失效'
+      : `裁决后${evaluation.changedCoder === 'both' ? '两位编码者' : `编码者 ${evaluation.changedCoder}`}的判断被改动，裁决自动失效`;
+    adjudication.status = 'stale';
+    adjudication.staleReason = reason;
+    adjudication.closedAt = now;
+    if (segment) {
+      adjudication.snapshotA = [...segment.assignments.A];
+      adjudication.snapshotB = [...segment.assignments.B];
+    }
+    invalidated.push({ segmentId: adjudication.segmentId, reason });
+  });
+  return invalidated;
+};
+
 const [state, setState] = createStore<CodingState>(loadLocal());
 const [undoStack, setUndoStack] = createSignal<CodingState[]>([]);
 const [redoStack, setRedoStack] = createSignal<CodingState[]>([]);
 const [remoteEnvelope, setRemoteEnvelope] = createSignal<PersistedEnvelope | null>(null);
 const [storageReady, setStorageReady] = createSignal(false);
 const [lastSavedAt, setLastSavedAt] = createSignal<Date | null>(null);
+const [inspectorTab, setInspectorTab] = createSignal<'theme' | 'compare' | 'audit'>('theme');
 let channel: BroadcastChannel | null = null;
 let hydrating = false;
 let saveTimer: number | undefined;
@@ -54,11 +88,16 @@ createEffect(() => {
 const transaction = (action: string, detail: string, mutator: (draft: CodingState) => void) => {
   setUndoStack((items) => [...items.slice(-49), cloneState(state)]);
   setRedoStack([]);
+  const now = new Date().toISOString();
   const next = cloneState(state);
   mutator(next);
+  const invalidated = reconcileAdjudications(next, now);
   next.revision = state.revision + 1;
-  next.updatedAt = new Date().toISOString();
-  next.audit.unshift({ id: crypto.randomUUID(), at: next.updatedAt, action, detail });
+  next.updatedAt = now;
+  next.audit.unshift({ id: crypto.randomUUID(), at: now, action, detail });
+  invalidated.forEach((item) => {
+    next.audit.unshift({ id: crypto.randomUUID(), at: now, action: '裁决失效', detail: item.reason });
+  });
   next.audit = next.audit.slice(0, 250);
   setState(reconcile(next, { merge: false }));
   persist(next);
@@ -262,26 +301,134 @@ export function useCodingStore() {
     });
   };
 
+  /**
+   * 对一条分歧作出裁决：采纳 A、采纳 B，或研究者另立主题（可多选现有主题/新建主题）。
+   * 同一片段再次裁决时，旧裁决记录标记为被取代；裁决依据必填。
+   */
+  const adjudicate = (input: {
+    segmentId: string;
+    decision: AdjudicationDecision;
+    customThemeIds?: string[];
+    newThemeName?: string;
+    rationale: string;
+    adjudicator: string;
+  }) => {
+    const segment = state.segments.find((item) => item.id === input.segmentId);
+    if (!segment) return;
+    if (sameAssignment(segment.assignments.A, segment.assignments.B)) return;
+    transaction('裁决分歧', `${decisionLabel(input.decision)} · 片段 ${segment.time}`, (draft) => {
+      const draftSegment = draft.segments.find((item) => item.id === input.segmentId);
+      if (!draftSegment) return;
+      let resolvedThemeIds: string[];
+      if (input.decision === 'adoptA') resolvedThemeIds = [...draftSegment.assignments.A];
+      else if (input.decision === 'adoptB') resolvedThemeIds = [...draftSegment.assignments.B];
+      else {
+        resolvedThemeIds = [...(input.customThemeIds ?? [])];
+        const newName = input.newThemeName?.trim();
+        if (newName) {
+          const newId = `t-${crypto.randomUUID()}`;
+          draft.themes.push({ id: newId, name: newName, parentId: null, color: '#7a5e9e', definition: '', memo: '', examples: [] });
+          resolvedThemeIds.push(newId);
+        }
+      }
+      if (input.decision === 'custom' && !resolvedThemeIds.length) return;
+      const id = `adj-${crypto.randomUUID()}`;
+      const at = new Date().toISOString();
+      draft.adjudications
+        .filter((item) => item.segmentId === input.segmentId && item.status === 'active')
+        .forEach((item) => { item.status = 'stale'; item.staleReason = '已被新的裁决取代'; item.closedAt = at; item.supersededById = id; });
+      draft.adjudications.push({
+        id,
+        segmentId: input.segmentId,
+        decision: input.decision,
+        resolvedThemeIds: [...new Set(resolvedThemeIds)],
+        rationale: input.rationale.trim(),
+        adjudicator: input.adjudicator.trim() || '未署名',
+        decidedAt: at,
+        status: 'active',
+        originalA: [...draftSegment.assignments.A],
+        originalB: [...draftSegment.assignments.B],
+        snapshotA: [...draftSegment.assignments.A],
+        snapshotB: [...draftSegment.assignments.B]
+      });
+    });
+  };
+
+  /** 待办队列中确认双方已趋同、无需裁决，关闭条目 */
+  const dismissAdjudication = (segmentId: string, note: string) => {
+    const current = state.adjudications.find((item) => item.segmentId === segmentId);
+    const segment = state.segments.find((item) => item.id === segmentId);
+    if (!segment || !sameAssignment(segment.assignments.A, segment.assignments.B)) return;
+    const at = new Date().toISOString();
+    if (current) {
+      transaction('关闭裁决待办', note || '双方判断已趋同', (draft) => {
+        const item = draft.adjudications.find((entry) => entry.id === current.id);
+        if (item) { item.status = 'closed'; item.closedAt = at; item.staleReason = note || '双方判断已趋同'; }
+      });
+    } else {
+      const id = `adj-${crypto.randomUUID()}`;
+      transaction('关闭裁决待办', note || '双方判断已趋同', (draft) => {
+        const draftSegment = draft.segments.find((item) => item.id === segmentId);
+        draft.adjudications.push({
+          id,
+          segmentId,
+          decision: 'custom',
+          resolvedThemeIds: draftSegment ? [...draftSegment.assignments.A] : [],
+          rationale: note || '双方判断已趋同，无需裁决',
+          adjudicator: state.coderA,
+          decidedAt: at,
+          status: 'closed',
+          closedAt: at,
+          staleReason: note || '双方判断已趋同',
+          originalA: draftSegment ? [...draftSegment.assignments.A] : [],
+          originalB: draftSegment ? [...draftSegment.assignments.B] : [],
+          snapshotA: draftSegment ? [...draftSegment.assignments.A] : [],
+          snapshotB: draftSegment ? [...draftSegment.assignments.B] : []
+        });
+      });
+    }
+  };
+
+  const openSegmentInCompare = (segmentId: string, transcriptId: string) => {
+    setState('activeTranscriptId', transcriptId);
+    setState('activeSegmentId', segmentId);
+    setInspectorTab('compare');
+  };
+
+  const adjudicationQueue = () => buildAdjudicationQueue(state.segments, state.adjudications);
+  const pendingCount = () => adjudicationQueue().filter((entry) => entry.queueKind === 'pending' || entry.queueKind === 'stale').length;
+
   const exportCoding = (format: 'json' | 'csv') => {
-    const segmentMap = new Map(state.segments.map((segment) => [segment.id, segment]));
     const themeMap = new Map(state.themes.map((theme) => [theme.id, theme]));
-    if (format === 'json') return JSON.stringify({ exportedAt: new Date().toISOString(), ...cloneState(state) }, null, 2);
+    if (format === 'json') {
+      const snapshot = cloneState(state);
+      // 过期/已关闭裁决不进入导出，只保留当前仍然有效的结论
+      snapshot.adjudications = activeAdjudicationsForExport(state.segments, state.adjudications);
+      return JSON.stringify({ exportedAt: new Date().toISOString(), ...snapshot }, null, 2);
+    }
     const escape = (value: string) => `"${value.replaceAll('"', '""')}"`;
-    const rows = [['片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录'].map(escape).join(',')];
+    const validAdjudications = new Map(
+      activeAdjudicationsForExport(state.segments, state.adjudications).map((item) => [item.segmentId, item])
+    );
+    const coderName = (coder: CoderId) => (coder === 'A' ? state.coderA : state.coderB);
+    const rows = [['片段编号', '时间', '发言人', '原文', '编码者', '主题路径', '备忘录', '裁决结论', '裁决采纳主题', '裁决依据', '裁决人', '裁决时间'].map(escape).join(',')];
     state.segments.forEach((segment) => {
       (['A', 'B'] as CoderId[]).forEach((coder) => {
-        const name = coder === 'A' ? state.coderA : state.coderB;
-        const themeIds = segment.assignments[coder];
-        const paths = themeIds.length ? themeIds.map((id) => {
-          const names: string[] = [];
-          let current = themeMap.get(id);
-          while (current) {
-            names.unshift(current.name);
-            current = current.parentId ? themeMap.get(current.parentId) : undefined;
-          }
-          return names.join(' / ');
-        }) : ['未编码'];
-        rows.push([segment.id, segment.time, segment.speaker, segment.text, name, paths.join(' | '), segmentMap.get(segment.id)?.note ?? ''].map(escape).join(','));
+        const ruling = validAdjudications.get(segment.id);
+        rows.push([
+          segment.id,
+          segment.time,
+          segment.speaker,
+          segment.text,
+          coderName(coder),
+          themePathList(segment.assignments[coder], themeMap),
+          segment.note,
+          ruling ? decisionLabel(ruling.decision) : '',
+          ruling ? themePathList(ruling.resolvedThemeIds, themeMap) : '',
+          ruling ? ruling.rationale : '',
+          ruling ? ruling.adjudicator : '',
+          ruling ? new Date(ruling.decidedAt).toLocaleString('zh-CN') : ''
+        ].map(escape).join(','));
       });
     });
     return `\uFEFF${rows.join('\n')}`;
@@ -308,7 +455,7 @@ export function useCodingStore() {
     if (!remote) return;
     setUndoStack((items) => [...items, cloneState(state)]);
     setRedoStack([]);
-    setState(reconcile(remote.state, { merge: false }));
+    setState(reconcile(normalizeState(remote.state), { merge: false }));
     setRemoteEnvelope(null);
   };
 
@@ -335,6 +482,11 @@ export function useCodingStore() {
     updateSegment,
     importTranscript,
     addExample,
+    adjudicate,
+    dismissAdjudication,
+    openSegmentInCompare,
+    adjudicationQueue,
+    pendingCount,
     exportCoding,
     downloadExport,
     orderedThemes,
@@ -342,6 +494,8 @@ export function useCodingStore() {
     keepLocalVersion,
     applyRemoteVersion,
     storageReady,
-    lastSavedAt
+    lastSavedAt,
+    inspectorTab,
+    setInspectorTab
   };
 }

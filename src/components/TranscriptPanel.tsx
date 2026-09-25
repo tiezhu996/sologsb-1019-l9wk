@@ -14,6 +14,14 @@ export default function TranscriptPanel(props: { store: Store }) {
     .filter((segment) => `${segment.speaker} ${segment.text}`.toLowerCase().includes(query().toLowerCase()))
     .sort((a, b) => a.order - b.order));
 
+  const queueEntryMap = createMemo(() => {
+    const map = new Map<string, ReturnType<Store['adjudicationQueue']>[number]>();
+    props.store.adjudicationQueue().forEach((entry) => map.set(entry.segment.id, entry));
+    return map;
+  });
+
+  const statusOf = (segmentId: string) => queueEntryMap().get(segmentId)?.queueKind;
+
   const toggleSelected = (id: string) => {
     setSelected((items) => items.includes(id) ? items.filter((item) => item !== id) : [...items, id]);
   };
@@ -87,8 +95,17 @@ export default function TranscriptPanel(props: { store: Store }) {
                 <span class="segment-index">#{index() + 1}</span>
                 <span class="segment-time">{segment.time}</span>
                 <strong>{segment.speaker}</strong>
-                <Show when={segment.assignments.A.join('|') !== segment.assignments.B.join('|')}>
+                <Show when={segment.assignments.A.join('|') !== segment.assignments.B.join('|') && !statusOf(segment.id)}>
                   <span class="conflict-dot" title="两位编码者判断不一致">分歧</span>
+                </Show>
+                <Show when={statusOf(segment.id) === 'pending'}>
+                  <button class="adj-pill pending" onClick={(event) => { event.stopPropagation(); props.store.openSegmentInCompare(segment.id, segment.transcriptId); }} title="打开裁决">待裁决</button>
+                </Show>
+                <Show when={statusOf(segment.id) === 'stale'}>
+                  <button class="adj-pill stale" onClick={(event) => { event.stopPropagation(); props.store.openSegmentInCompare(segment.id, segment.transcriptId); }} title="原裁决已失效，点击重新裁决">已失效</button>
+                </Show>
+                <Show when={statusOf(segment.id) === 'resolved'}>
+                  <button class="adj-pill resolved" onClick={(event) => { event.stopPropagation(); props.store.openSegmentInCompare(segment.id, segment.transcriptId); }} title="已有有效裁决，点击查看">已裁决</button>
                 </Show>
               </div>
               <p>{segment.text}</p>
